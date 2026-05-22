@@ -9,7 +9,7 @@ pub enum NetworkArg {
 }
 
 /// The CLI handler for the bam_boost program
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum BamBoostCommands {
     /// MerkleDistributor operations
     MerkleDistributor {
@@ -25,12 +25,12 @@ pub enum BamBoostCommands {
 }
 
 /// The actions that can be performed on the bam_boost MerkleDistributor
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum MerkleDistributorActions {
     /// Claim
     Claim {
         /// Network type (mainnet or testnet)
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, default_value = "mainnet")]
         network: NetworkArg,
 
         /// Epoch number
@@ -40,7 +40,7 @@ pub enum MerkleDistributorActions {
 }
 
 /// The actions that can be performed on the bam_boost ClaimStatus
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum ClaimStatusActions {
     /// Get ClaimStatus
     Get {
