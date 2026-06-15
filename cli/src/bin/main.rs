@@ -3,7 +3,7 @@ use std::{str::FromStr, sync::Arc};
 use clap::Parser;
 use env_logger::Env;
 use jito_bam_boost_cli::{
-    bam_boost_handler::BamBoostCliHandler,
+    bam_boost_handler::{parse_pubkey_list, resolve_nonce_specs, BamBoostCliHandler},
     cli_args::{Cli, ProgramCommand},
     cli_config::CliConfig,
 };
@@ -22,6 +22,15 @@ pub fn get_cli_config(args: &Cli) -> Result<CliConfig, anyhow::Error> {
         _ => None,
     };
 
+    let address = match &args.address {
+        Some(addr_str) => {
+            let pubkey = Pubkey::from_str(addr_str)
+                .map_err(|e| anyhow::anyhow!("Failed to parse --address pubkey: {}", e))?;
+            Some(pubkey)
+        }
+        None => None,
+    };
+
     let cli_config = CliConfig {
         rpc_url: args
             .rpc_url
@@ -33,6 +42,7 @@ pub fn get_cli_config(args: &Cli) -> Result<CliConfig, anyhow::Error> {
                 .ok_or_else(|| anyhow::anyhow!("commitment is required"))?,
         )?,
         signer,
+        address,
     };
 
     Ok(cli_config)
@@ -53,6 +63,12 @@ async fn main() -> Result<(), anyhow::Error> {
             JITO_BAM_BOOST_PROGRAM_ID
         };
 
+    // Parse the (possibly comma-separated) nonce accounts and authorities, then
+    // pair them up (each nonce defaults to authorizing itself).
+    let nonce_accounts = parse_pubkey_list(args.nonce.as_deref())?;
+    let nonce_authorities = parse_pubkey_list(args.nonce_authority.as_deref())?;
+    let nonces = resolve_nonce_specs(nonce_accounts, nonce_authorities)?;
+
     match args.command.expect("Command not found") {
         ProgramCommand::BamBoost { action } => {
             BamBoostCliHandler::new(
@@ -61,6 +77,9 @@ async fn main() -> Result<(), anyhow::Error> {
                 args.print_tx,
                 args.print_json,
                 args.print_json_with_reserves,
+                args.assert_deploy_slot,
+                nonces,
+                args.output,
             )
             .handle(action)
             .await?;
