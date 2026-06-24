@@ -98,10 +98,19 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+/// Public RPC used as an automatic fallback when the primary `--rpc-url`
+/// endpoint fails (e.g. the public mainnet endpoint timing out / rate-limiting).
+/// PublicNode is keyless and free; see README.
+const FALLBACK_RPC_URL: &str = "https://solana-rpc.publicnode.com";
+
 #[allow(dead_code)]
 pub struct BamBoostCliHandler {
     /// The configuration of CLI
     cli_config: CliConfig,
+
+    /// Ordered RPC endpoints to try: the primary (`--rpc-url`) first, then
+    /// fallbacks. Each RPC call walks this list until one succeeds.
+    rpc_urls: Vec<String>,
 
     /// The Pubkey of the Jito BAM Boost Program
     bam_boost_program_id: Pubkey,
@@ -133,8 +142,16 @@ impl BamBoostCliHandler {
         assert_deploy_slot: DeploySlotGuard,
         output: OutputFormat,
     ) -> Self {
+        // Primary endpoint first, then the public fallback (skipped if the
+        // primary already is the fallback).
+        let mut rpc_urls = vec![cli_config.rpc_url.clone()];
+        if cli_config.rpc_url.trim_end_matches('/') != FALLBACK_RPC_URL {
+            rpc_urls.push(FALLBACK_RPC_URL.to_string());
+        }
+
         Self {
             cli_config,
+            rpc_urls,
             bam_boost_program_id,
             print_tx,
             print_json,
@@ -142,6 +159,44 @@ impl BamBoostCliHandler {
             assert_deploy_slot,
             output,
         }
+    }
+
+    /// Run an RPC operation against each configured endpoint in order, returning
+    /// the first success. On failure it logs and falls through to the next
+    /// endpoint (primary → fallback); if all fail, returns the last error.
+    ///
+    /// This is the single choke point through which every RPC call flows, so the
+    /// fallback applies uniformly to account reads, epoch info, blockhash
+    /// fetches, and transaction submission.
+    fn with_rpc<T, E: std::fmt::Display>(
+        &self,
+        label: &str,
+        op: impl Fn(&RpcClient) -> Result<T, E>,
+    ) -> anyhow::Result<T> {
+        let mut last_err = String::from("no endpoints configured");
+        for (i, url) in self.rpc_urls.iter().enumerate() {
+            let client = RpcClient::new_with_commitment(url.clone(), self.cli_config.commitment);
+            match op(&client) {
+                Ok(v) => {
+                    if i > 0 {
+                        log::warn!("{label}: recovered via fallback RPC ({url})");
+                    }
+                    return Ok(v);
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    if i + 1 < self.rpc_urls.len() {
+                        log::warn!(
+                            "{label}: RPC {url} failed ({last_err}); trying fallback endpoint"
+                        );
+                    }
+                }
+            }
+        }
+        Err(anyhow!(
+            "{label}: all {} RPC endpoint(s) failed; last error: {last_err}",
+            self.rpc_urls.len()
+        ))
     }
 
     /// Emit the unsigned transactions built during a claim run in the selected
@@ -187,7 +242,9 @@ impl BamBoostCliHandler {
             DeploySlotGuard::Off => Ok(None),
             DeploySlotGuard::Slot(slot) => Ok(Some(*slot)),
             DeploySlotGuard::Auto => {
-                let account = self.get_rpc_client().get_account(&BAM_BOOST_PROGRAM_DATA)?;
+                let account = self.with_rpc("fetch ProgramData deploy slot", |c| {
+                    c.get_account(&BAM_BOOST_PROGRAM_DATA)
+                })?;
                 let slot = parse_program_data_slot(&account.data)?;
                 log::info!(
                     "Auto-resolved BAM Boost ProgramData deploy slot to {slot} (Lighthouse guard enabled)"
@@ -294,7 +351,9 @@ impl BamBoostCliHandler {
         // Scan through the current epoch inclusive: BAM Boost publishes a tree
         // for an epoch around the time it ends, so the current epoch's tree may
         // already be claimable.
-        let end_epoch = self.get_rpc_client().get_epoch_info()?.epoch;
+        let end_epoch = self
+            .with_rpc("get current epoch", |c| c.get_epoch_info())?
+            .epoch;
 
         let start_epoch = match first_epoch {
             Some(fe) => {
@@ -439,7 +498,6 @@ impl BamBoostCliHandler {
     /// Non-fatal conditions are reported via [`Eligibility`]; only genuine
     /// errors (network/parse failures) return `Err`.
     async fn check_eligibility(&self, cluster: &str, epoch: u64) -> anyhow::Result<Eligibility> {
-        let rpc_client = self.get_rpc_client();
         let claimant = self.resolve_claimant()?;
 
         let distributor_pda = self.merkle_distributor_address(JITOSOL_MINT, epoch);
@@ -506,7 +564,17 @@ impl BamBoostCliHandler {
 
         let claim_status_pda = Pubkey::new_from_array(claim_status_pda.to_bytes());
 
-        if rpc_client.get_account(&claim_status_pda).is_ok() {
+        // Use get_account_with_commitment so a genuine "account not found"
+        // (value == None → eligible) is distinguished from a transport error
+        // (Err → retried/failed over, never silently treated as eligible).
+        let commitment = self.cli_config.commitment;
+        let claim_status_exists = self
+            .with_rpc("check claim status account", |c| {
+                c.get_account_with_commitment(&claim_status_pda, commitment)
+            })?
+            .value
+            .is_some();
+        if claim_status_exists {
             log::info!("Epoch {epoch} already claimed (claim status account exists)");
             return Ok(Eligibility::AlreadyClaimed);
         }
@@ -599,23 +667,12 @@ impl BamBoostCliHandler {
         Ok(())
     }
 
-    /// Creates a new RPC client using the configuration from the CLI handler.
+    /// Fetches and deserializes an account (with RPC fallback).
     ///
-    /// This method constructs an RPC client with the URL and commitment level specified in the
-    /// CLI configuration. The client can be used to communicate with a Solana node for
-    /// submitting transactions, querying account data, and other RPC operations.
-    fn get_rpc_client(&self) -> RpcClient {
-        RpcClient::new_with_commitment(self.cli_config.rpc_url.clone(), self.cli_config.commitment)
-    }
-
-    /// Fetches and deserializes an account
-    ///
-    /// This method retrieves account data using the configured RPC client,
-    /// then deserializes it into the specified account type using Borsh deserialization.
+    /// Retrieves account data via [`Self::with_rpc`], then deserializes it into
+    /// the specified account type using Borsh deserialization.
     fn get_account<T: BorshDeserialize>(&self, account_pubkey: &Pubkey) -> anyhow::Result<T> {
-        let rpc_client = self.get_rpc_client();
-
-        let account = rpc_client.get_account(account_pubkey)?;
+        let account = self.with_rpc("get account", |c| c.get_account(account_pubkey))?;
         let account = T::deserialize(&mut account.data.as_slice())?;
 
         Ok(account)
@@ -634,11 +691,9 @@ impl BamBoostCliHandler {
         ixs: &[Instruction],
         payer: &Pubkey,
     ) -> anyhow::Result<Option<UnsignedTx>> {
-        let rpc_client = self.get_rpc_client();
-
         if self.should_print_tx() {
             // Build unsigned transaction
-            let blockhash = rpc_client.get_latest_blockhash()?;
+            let blockhash = self.with_rpc("get latest blockhash", |c| c.get_latest_blockhash())?;
 
             let message = Message::new(ixs, Some(payer));
             let mut tx = Transaction::new_unsigned(message);
@@ -666,10 +721,12 @@ impl BamBoostCliHandler {
             .clone()
             .ok_or_else(|| anyhow!("signer is required to send transactions"))?;
 
-        let blockhash = rpc_client.get_latest_blockhash()?;
+        let blockhash = self.with_rpc("get latest blockhash", |c| c.get_latest_blockhash())?;
 
         let tx = Transaction::new_signed_with_payer(ixs, Some(payer), &[&*signer], blockhash);
-        let result = rpc_client.send_and_confirm_transaction(&tx)?;
+        // Resending the same signed transaction to another endpoint is safe:
+        // Solana dedups by signature, and the claim-status PDA guards double-claims.
+        let result = self.with_rpc("send transaction", |c| c.send_and_confirm_transaction(&tx))?;
 
         log::info!("Transaction confirmed: {:?}", result);
 

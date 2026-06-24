@@ -52,6 +52,7 @@ sequenceDiagram
 | **Validator signing (`--address`)** | Build unsigned transactions without a keypair on the machine. Send to the validator box for signing with the identity keypair. |
 | **Program integrity guard (`--assert-deploy-slot`)** | **On by default.** Prepends a [Lighthouse](https://github.com/Jac0xb/lighthouse) assertion that the BAM Boost ProgramData hasn't been upgraded. Transaction rolls back atomically if bytecode changed. Defaults to `auto` (resolves the program's current deploy slot from RPC at build time); pass an explicit slot to pin a known value, or `off` to disable. |
 | **Scan-all claim (omit `--epoch`)** | Omit `--epoch` to scan every epoch from `--first-epoch` through the current epoch and claim each eligible one. Epochs with no published tree, no allocation, or an existing claim are skipped; per-epoch errors don't abort the scan. |
+| **Automatic RPC fallback** | Every RPC call tries `--rpc-url` first, then falls back to the public `solana-rpc.publicnode.com` if it errors/times out — so a flaky primary endpoint doesn't abort a run. |
 | **Transaction inspection (`--print-tx`)** | Output the unsigned transaction as base58 for review before signing. |
 | **Safe defaults** | `--address` mode forces unsigned output. `--print-tx` prevents accidental sending. |
 
@@ -248,7 +249,7 @@ graph LR
 |------|----------|-------------|
 | `--signer <path>` | One of signer/address | Path to identity keypair (signs + sends) |
 | `--address <pubkey>` | One of signer/address | Claimant pubkey (outputs unsigned tx) |
-| `--rpc-url <url>` | No (default: mainnet) | Solana RPC endpoint |
+| `--rpc-url <url>` | No (default: mainnet) | Primary Solana RPC endpoint. On failure, each RPC call automatically falls back to the public `solana-rpc.publicnode.com` |
 | `--commitment <level>` | Yes | `confirmed` or `finalized` |
 | `--print-tx` | No | Output unsigned tx instead of sending |
 | `--output <text\|json>` | No (default: `text`) | Format for built unsigned txs. `text` = base58 per line; `json` = manifest array on stdout (logs on stderr) for automation |
