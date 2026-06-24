@@ -3,7 +3,7 @@ use std::{str::FromStr, sync::Arc};
 use clap::Parser;
 use env_logger::Env;
 use jito_bam_boost_cli::{
-    bam_boost_handler::{parse_pubkey_list, resolve_nonce_specs, BamBoostCliHandler},
+    bam_boost_handler::BamBoostCliHandler,
     cli_args::{Cli, ProgramCommand},
     cli_config::CliConfig,
 };
@@ -63,12 +63,6 @@ async fn main() -> Result<(), anyhow::Error> {
             JITO_BAM_BOOST_PROGRAM_ID
         };
 
-    // Parse the (possibly comma-separated) nonce accounts and authorities, then
-    // pair them up (each nonce defaults to authorizing itself).
-    let nonce_accounts = parse_pubkey_list(args.nonce.as_deref())?;
-    let nonce_authorities = parse_pubkey_list(args.nonce_authority.as_deref())?;
-    let nonces = resolve_nonce_specs(nonce_accounts, nonce_authorities)?;
-
     match args.command.expect("Command not found") {
         ProgramCommand::BamBoost { action } => {
             BamBoostCliHandler::new(
@@ -78,7 +72,6 @@ async fn main() -> Result<(), anyhow::Error> {
                 args.print_json,
                 args.print_json_with_reserves,
                 args.assert_deploy_slot,
-                nonces,
                 args.output,
             )
             .handle(action)

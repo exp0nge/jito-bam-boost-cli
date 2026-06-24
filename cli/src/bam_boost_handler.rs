@@ -1,10 +1,7 @@
-use std::str::FromStr;
-
 use anyhow::anyhow;
 use borsh::BorshDeserialize;
 use jito_bam_boost_client::{accounts::ClaimStatus, instructions::ClaimBuilder};
 use jito_bam_boost_merkle_tree::bam_boost_merkle_tree::BamBoostMerkleTree;
-use solana_hash::Hash;
 use solana_keypair::Signer;
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
@@ -55,11 +52,7 @@ impl UnsignedTx {
     }
 }
 
-/// A durable nonce account paired with its authority.
-type NonceSpec = (Pubkey, Pubkey);
-
-/// Everything needed to build a claim for one epoch, once eligibility is
-/// confirmed. Lets the scanner decide nonce assignment before building.
+/// Everything needed to build a claim for one epoch, once eligibility is confirmed.
 struct EligibleClaim {
     distributor_pda: Pubkey,
     claim_status_pda: Pubkey,
@@ -76,46 +69,6 @@ enum Eligibility {
     NotAllocated,
     AlreadyClaimed,
     Eligible(Box<EligibleClaim>),
-}
-
-/// Parse a comma-separated list of base58 pubkeys. Whitespace is trimmed and
-/// empty entries ignored; `None` or an empty/whitespace string yields `[]`.
-pub fn parse_pubkey_list(s: Option<&str>) -> anyhow::Result<Vec<Pubkey>> {
-    let Some(s) = s else {
-        return Ok(Vec::new());
-    };
-    s.split(',')
-        .map(str::trim)
-        .filter(|x| !x.is_empty())
-        .map(|x| Pubkey::from_str(x).map_err(|e| anyhow!("invalid pubkey '{x}': {e}")))
-        .collect()
-}
-
-/// Pair nonce accounts with authorities. The authority list may be empty (each
-/// nonce authorizes itself), length 1 (applied to every nonce), or equal in
-/// length to the nonces (paired 1:1). Any other length is an error.
-pub fn resolve_nonce_specs(
-    nonces: Vec<Pubkey>,
-    authorities: Vec<Pubkey>,
-) -> anyhow::Result<Vec<NonceSpec>> {
-    if nonces.is_empty() {
-        if !authorities.is_empty() {
-            return Err(anyhow!("--nonce-authority given without --nonce"));
-        }
-        return Ok(Vec::new());
-    }
-    let pairs: Vec<NonceSpec> = match authorities.len() {
-        0 => nonces.iter().map(|n| (*n, *n)).collect(),
-        1 => nonces.iter().map(|n| (*n, authorities[0])).collect(),
-        a if a == nonces.len() => nonces.into_iter().zip(authorities).collect(),
-        a => {
-            return Err(anyhow!(
-                "--nonce-authority count ({a}) must be 0, 1, or equal to the --nonce count ({})",
-                nonces.len()
-            ))
-        }
-    };
-    Ok(pairs)
 }
 
 /// Standard base64 (RFC 4648, with padding) — the encoding Solana RPC expects
@@ -165,12 +118,6 @@ pub struct BamBoostCliHandler {
     /// Lighthouse deploy-slot guard: auto-resolve from RPC, an explicit slot, or off
     assert_deploy_slot: DeploySlotGuard,
 
-    /// Durable nonce accounts paired with their authorities. Empty unless
-    /// --nonce was given. Durable nonces are single-use, so in scan mode one
-    /// nonce is assigned per eligible epoch and the count must be >= the number
-    /// of epochs to claim.
-    nonces: Vec<NonceSpec>,
-
     /// Output format for built unsigned transactions
     output: OutputFormat,
 }
@@ -184,7 +131,6 @@ impl BamBoostCliHandler {
         print_json: bool,
         print_json_with_reserves: bool,
         assert_deploy_slot: DeploySlotGuard,
-        nonces: Vec<NonceSpec>,
         output: OutputFormat,
     ) -> Self {
         Self {
@@ -194,7 +140,6 @@ impl BamBoostCliHandler {
             print_json,
             print_json_with_reserves,
             assert_deploy_slot,
-            nonces,
             output,
         }
     }
@@ -312,34 +257,15 @@ impl BamBoostCliHandler {
         .0
     }
 
-    /// Parse the stored nonce hash from a nonce account's raw data.
-    /// Layout: 4 bytes version (u32 LE) + 4 bytes state (u32 LE) + 32 bytes authority + 32 bytes blockhash + ...
-    /// The nonce hash is at offset 40.
-    fn parse_nonce_hash(data: &[u8]) -> anyhow::Result<Hash> {
-        if data.len() < 72 {
-            return Err(anyhow!("Nonce account data too short: {} bytes", data.len()));
-        }
-        let hash_bytes: [u8; 32] = data[40..72]
-            .try_into()
-            .map_err(|_| anyhow!("Failed to extract nonce hash bytes"))?;
-        Ok(Hash::new_from_array(hash_bytes))
-    }
-
     /// Claim a single, explicitly requested epoch.
     ///
     /// Unlike scan-all mode, a not-eligible or already-claimed epoch here is
     /// surfaced as an error since the user asked for that specific epoch.
     async fn claim(&self, cluster: &str, epoch: u64) -> anyhow::Result<()> {
-        if self.nonces.len() > 1 {
-            return Err(anyhow!(
-                "{} nonce accounts given for a single-epoch claim; pass at most one --nonce.",
-                self.nonces.len()
-            ));
-        }
         let assert_slot = self.resolve_assert_slot()?;
         match self.check_eligibility(cluster, epoch).await? {
             Eligibility::Eligible(ec) => {
-                let unsigned = self.build_claim(&ec, assert_slot, self.nonces.first().copied())?;
+                let unsigned = self.build_claim(&ec, assert_slot)?;
                 let txs: Vec<UnsignedTx> = unsigned.into_iter().collect();
                 self.emit_unsigned(&txs);
                 Ok(())
@@ -364,11 +290,6 @@ impl BamBoostCliHandler {
     ///
     /// Epochs with no published tree, no allocation, or an existing claim are
     /// skipped; per-epoch errors are logged and do not abort the scan.
-    ///
-    /// Durable nonces are single-use, so when `--nonce` is given one nonce is
-    /// assigned per eligible epoch. If there are more eligible epochs than nonce
-    /// accounts, the run aborts before building anything (fail-closed) rather
-    /// than emitting transactions that could never all land.
     async fn claim_all(&self, cluster: &str, first_epoch: Option<u64>) -> anyhow::Result<()> {
         // Scan through the current epoch inclusive: BAM Boost publishes a tree
         // for an epoch around the time it ends, so the current epoch's tree may
@@ -402,13 +323,23 @@ impl BamBoostCliHandler {
         // Resolve the deploy-slot guard once for the whole scan.
         let assert_slot = self.resolve_assert_slot()?;
 
-        // Pass 1: determine eligibility for every epoch (no transactions built
-        // yet), so nonces can be assigned and validated before any work.
+        // For each epoch, check eligibility and build (and sign/send, unless in
+        // print mode) the claim if eligible.
         let mut counters = ScanCounters::default();
-        let mut eligible: Vec<(u64, EligibleClaim)> = Vec::new();
+        let mut unsigned_txs: Vec<UnsignedTx> = Vec::new();
         for epoch in start_epoch..=end_epoch {
             match self.check_eligibility(cluster, epoch).await {
-                Ok(Eligibility::Eligible(ec)) => eligible.push((epoch, *ec)),
+                Ok(Eligibility::Eligible(ec)) => match self.build_claim(&ec, assert_slot) {
+                    Ok(unsigned) => {
+                        counters.claimed += 1;
+                        log::info!("Epoch {epoch}: CLAIMED");
+                        unsigned_txs.extend(unsigned);
+                    }
+                    Err(e) => {
+                        counters.errored += 1;
+                        log::error!("Epoch {epoch}: build FAILED — {e}");
+                    }
+                },
                 Ok(Eligibility::AlreadyClaimed) => {
                     counters.already += 1;
                     log::info!("Epoch {epoch}: already claimed");
@@ -424,43 +355,6 @@ impl BamBoostCliHandler {
                 Err(e) => {
                     counters.errored += 1;
                     log::error!("Epoch {epoch}: eligibility check FAILED — {e}");
-                }
-            }
-        }
-
-        // Fail closed: a durable nonce can authorize exactly one transaction, so
-        // we need at least one nonce per eligible epoch. Abort before building.
-        let nonce_mode = !self.nonces.is_empty();
-        if nonce_mode && eligible.len() > self.nonces.len() {
-            let epochs: Vec<String> = eligible.iter().map(|(e, _)| e.to_string()).collect();
-            return Err(anyhow!(
-                "{} eligible epochs ({}) but only {} durable nonce account(s) provided. \
-                 Durable nonces are single-use — provide one --nonce per claim, narrow the \
-                 range with --first-epoch/--epoch, or omit --nonce to use a recent blockhash.",
-                eligible.len(),
-                epochs.join(", "),
-                self.nonces.len()
-            ));
-        }
-
-        // Pass 2: build (and sign/send, unless in print mode) each eligible
-        // claim, assigning one nonce per epoch when in nonce mode.
-        let mut unsigned_txs: Vec<UnsignedTx> = Vec::new();
-        for (i, (epoch, ec)) in eligible.iter().enumerate() {
-            let nonce = if nonce_mode {
-                Some(self.nonces[i])
-            } else {
-                None
-            };
-            match self.build_claim(ec, assert_slot, nonce) {
-                Ok(unsigned) => {
-                    counters.claimed += 1;
-                    log::info!("Epoch {epoch}: CLAIMED");
-                    unsigned_txs.extend(unsigned);
-                }
-                Err(e) => {
-                    counters.errored += 1;
-                    log::error!("Epoch {epoch}: build FAILED — {e}");
                 }
             }
         }
@@ -635,13 +529,10 @@ impl BamBoostCliHandler {
 
     /// Build the claim transaction for an already-confirmed-eligible epoch and
     /// either send it (signed mode) or return it unsigned (print/offline mode).
-    /// `nonce` is the durable nonce (account, authority) assigned to this claim,
-    /// or `None` to use a recent blockhash.
     fn build_claim(
         &self,
         ec: &EligibleClaim,
         assert_slot: Option<u64>,
-        nonce: Option<NonceSpec>,
     ) -> anyhow::Result<Option<UnsignedTx>> {
         let mut ix_builder = ClaimBuilder::new();
         ix_builder
@@ -658,25 +549,15 @@ impl BamBoostCliHandler {
 
         log::info!("Claiming parameters: {ix_builder:?}");
 
-        // Build instruction list: nonce advance (if any) -> lighthouse assert (if any) -> ATA create -> claim
+        // Build instruction list: lighthouse assert (if any) -> ATA create -> claim
         let mut ixs: Vec<Instruction> = Vec::new();
 
-        // 1. Durable nonce advance (must be first instruction)
-        if let Some((nonce_account, authority)) = nonce {
-            ixs.push(
-                solana_system_interface::instruction::advance_nonce_account(
-                    &nonce_account,
-                    &authority,
-                ),
-            );
-        }
-
-        // 2. Lighthouse deploy-slot assertion
+        // 1. Lighthouse deploy-slot assertion
         if let Some(slot) = assert_slot {
             ixs.push(build_assert_deploy_slot_ix(slot));
         }
 
-        // 3. Create ATA (idempotent)
+        // 2. Create ATA (idempotent)
         ixs.push(create_associated_token_account_idempotent(
             &ec.claimant,
             &ec.claimant,
@@ -684,14 +565,13 @@ impl BamBoostCliHandler {
             &spl_token_interface::id(),
         ));
 
-        // 4. Claim instruction
+        // 3. Claim instruction
         ixs.push(ix);
 
-        let nonce_account = nonce.map(|(n, _)| n);
         // Signed mode signs and sends, returning None. Print/offline mode returns
         // the unsigned transaction (base58/base64) and nothing else — the signer
         // verifies details by decoding the bytes, not from sidecar metadata.
-        let built = self.process_transaction(&ixs, &ec.claimant, nonce_account)?;
+        let built = self.process_transaction(&ixs, &ec.claimant)?;
 
         // Only check claim status when we actually sent the transaction
         if !self.should_print_tx() {
@@ -753,18 +633,12 @@ impl BamBoostCliHandler {
         &self,
         ixs: &[Instruction],
         payer: &Pubkey,
-        nonce_account: Option<Pubkey>,
     ) -> anyhow::Result<Option<UnsignedTx>> {
         let rpc_client = self.get_rpc_client();
 
         if self.should_print_tx() {
             // Build unsigned transaction
-            let blockhash = if let Some(nonce_account) = nonce_account {
-                let account_data = rpc_client.get_account(&nonce_account)?;
-                Self::parse_nonce_hash(&account_data.data)?
-            } else {
-                rpc_client.get_latest_blockhash()?
-            };
+            let blockhash = rpc_client.get_latest_blockhash()?;
 
             let message = Message::new(ixs, Some(payer));
             let mut tx = Transaction::new_unsigned(message);
@@ -792,12 +666,7 @@ impl BamBoostCliHandler {
             .clone()
             .ok_or_else(|| anyhow!("signer is required to send transactions"))?;
 
-        let blockhash = if let Some(nonce_account) = nonce_account {
-            let account_data = rpc_client.get_account(&nonce_account)?;
-            Self::parse_nonce_hash(&account_data.data)?
-        } else {
-            rpc_client.get_latest_blockhash()?
-        };
+        let blockhash = rpc_client.get_latest_blockhash()?;
 
         let tx = Transaction::new_signed_with_payer(ixs, Some(payer), &[&*signer], blockhash);
         let result = rpc_client.send_and_confirm_transaction(&tx)?;
@@ -810,71 +679,7 @@ impl BamBoostCliHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_encode, parse_pubkey_list, resolve_nonce_specs, UnsignedTx};
-    use solana_pubkey::Pubkey;
-
-    // Distinct, valid base58 pubkeys for tests.
-    const A: &str = "11111111111111111111111111111111";
-    const B: &str = "So11111111111111111111111111111111111111112";
-    const C: &str = "Boostxbpp2ENYHGcTLYt1obpcY13HE4NojdqNWdzqSSb";
-
-    fn pk(s: &str) -> Pubkey {
-        s.parse().unwrap()
-    }
-
-    #[test]
-    fn test_parse_pubkey_list_empty_and_none() {
-        assert!(parse_pubkey_list(None).unwrap().is_empty());
-        assert!(parse_pubkey_list(Some("")).unwrap().is_empty());
-        assert!(parse_pubkey_list(Some("   ")).unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_parse_pubkey_list_trims_and_skips_blanks() {
-        let list = parse_pubkey_list(Some(&format!(" {A} , {B} ,, {C} "))).unwrap();
-        assert_eq!(list, vec![pk(A), pk(B), pk(C)]);
-    }
-
-    #[test]
-    fn test_parse_pubkey_list_rejects_invalid() {
-        assert!(parse_pubkey_list(Some("not-a-pubkey")).is_err());
-        assert!(parse_pubkey_list(Some(&format!("{A},nope"))).is_err());
-    }
-
-    #[test]
-    fn test_resolve_nonce_specs_empty() {
-        assert!(resolve_nonce_specs(vec![], vec![]).unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_resolve_nonce_specs_authority_given_without_nonce_errors() {
-        assert!(resolve_nonce_specs(vec![], vec![pk(A)]).is_err());
-    }
-
-    #[test]
-    fn test_resolve_nonce_specs_zero_authorities_defaults_to_self() {
-        let specs = resolve_nonce_specs(vec![pk(A), pk(B)], vec![]).unwrap();
-        assert_eq!(specs, vec![(pk(A), pk(A)), (pk(B), pk(B))]);
-    }
-
-    #[test]
-    fn test_resolve_nonce_specs_one_authority_applies_to_all() {
-        let specs = resolve_nonce_specs(vec![pk(A), pk(B)], vec![pk(C)]).unwrap();
-        assert_eq!(specs, vec![(pk(A), pk(C)), (pk(B), pk(C))]);
-    }
-
-    #[test]
-    fn test_resolve_nonce_specs_paired_one_to_one() {
-        let specs = resolve_nonce_specs(vec![pk(A), pk(B)], vec![pk(B), pk(C)]).unwrap();
-        assert_eq!(specs, vec![(pk(A), pk(B)), (pk(B), pk(C))]);
-    }
-
-    #[test]
-    fn test_resolve_nonce_specs_mismatched_count_errors() {
-        // 3 nonces but 2 authorities (not 0/1/3) -> error.
-        let err = resolve_nonce_specs(vec![pk(A), pk(B), pk(C)], vec![pk(A), pk(B)]).unwrap_err();
-        assert!(err.to_string().contains("must be 0, 1, or equal"));
-    }
+    use super::{base64_encode, UnsignedTx};
 
     #[test]
     fn test_base64_encode_rfc4648_vectors() {

@@ -10,7 +10,8 @@ pub enum OutputFormat {
     /// One base58 unsigned transaction per line (default).
     #[default]
     Text,
-    /// A JSON array pairing each epoch with its unsigned transaction and metadata.
+    /// A JSON array of `{unsigned_tx_base58, unsigned_tx_base64}` objects —
+    /// only the serialized transaction, no sidecar metadata.
     Json,
 }
 
@@ -107,7 +108,7 @@ pub struct Cli {
         global = true,
         value_enum,
         default_value_t = OutputFormat::Text,
-        help = "Output format for built unsigned transactions: 'text' (base58 lines) or 'json' (manifest of epoch + unsigned tx + metadata, for automation)"
+        help = "Output format for built unsigned transactions: 'text' (one base58 tx per line) or 'json' (array of {unsigned_tx_base58, unsigned_tx_base64} — serialized tx only, no metadata)"
     )]
     pub output: OutputFormat,
 
@@ -119,20 +120,6 @@ pub struct Cli {
         help = "Lighthouse program-integrity guard: \"auto\" (resolve current ProgramData deploy slot from RPC — default), an explicit slot number, or \"off\" to disable"
     )]
     pub assert_deploy_slot: DeploySlotGuard,
-
-    #[arg(
-        long,
-        global = true,
-        help = "Durable nonce account pubkey(s), comma-separated. Durable nonces are single-use, so scan-all mode needs one per epoch claimed (e.g. --nonce N1,N2,N3)"
-    )]
-    pub nonce: Option<String>,
-
-    #[arg(
-        long,
-        global = true,
-        help = "Nonce authority pubkey(s), comma-separated. Provide 0 (each nonce authorizes itself), 1 (applied to all), or one per --nonce"
-    )]
-    pub nonce_authority: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]

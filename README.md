@@ -1,6 +1,6 @@
 # Jito BAM Boost CLI
 
-CLI for safely claiming JIP-31 BAM Boost subsidies. Supports validator signing, program integrity guards, and durable nonce support.
+CLI for safely claiming JIP-31 BAM Boost subsidies. Supports validator signing and program integrity guards.
 
 ## Security Model
 
@@ -19,7 +19,7 @@ sequenceDiagram
         Note over CLI,RPC: Step 1: Build unsigned transaction
         CLI->>GCS: Fetch merkle tree for epoch
         GCS-->>CLI: Merkle proof + amount
-        CLI->>RPC: Fetch blockhash / nonce
+        CLI->>RPC: Fetch recent blockhash
         RPC-->>CLI: Blockhash
         CLI->>CLI: Build tx with:<br/>1. Lighthouse assert (deploy slot)<br/>2. Create ATA<br/>3. Claim(proof, amount)
         CLI-->>CLI: Output unsigned tx as base58
@@ -52,7 +52,6 @@ sequenceDiagram
 | **Validator signing (`--address`)** | Build unsigned transactions without a keypair on the machine. Send to the validator box for signing with the identity keypair. |
 | **Program integrity guard (`--assert-deploy-slot`)** | **On by default.** Prepends a [Lighthouse](https://github.com/Jac0xb/lighthouse) assertion that the BAM Boost ProgramData hasn't been upgraded. Transaction rolls back atomically if bytecode changed. Defaults to `auto` (resolves the program's current deploy slot from RPC at build time); pass an explicit slot to pin a known value, or `off` to disable. |
 | **Scan-all claim (omit `--epoch`)** | Omit `--epoch` to scan every epoch from `--first-epoch` through the current epoch and claim each eligible one. Epochs with no published tree, no allocation, or an existing claim are skipped; per-epoch errors don't abort the scan. |
-| **Durable nonces (`--nonce`)** | Use durable transaction nonces for long-lived transactions with no 90-second blockhash expiry. Accepts a list (one per epoch in scan-all mode, since nonces are single-use); fails closed if too few are provided. |
 | **Transaction inspection (`--print-tx`)** | Output the unsigned transaction as base58 for review before signing. |
 | **Safe defaults** | `--address` mode forces unsigned output. `--print-tx` prevents accidental sending. |
 
@@ -65,7 +64,7 @@ There are **two ways to claim**, both fully supported. Pick based on where the i
 | **Signed (default)** | `--signer <keypair>` | Builds, signs, **and submits** the transaction in one command | The identity keypair is on the machine running the CLI |
 | **Offline / unsigned (optional)** | `--address <pubkey>` | Builds the **unsigned** transaction only; you sign and submit it elsewhere | You want the keypair to stay off the build machine |
 
-The two are mutually exclusive (`--signer` conflicts with `--address`). Everything else — the integrity guard, durable nonces, scan-all, JSON output — works identically in both modes.
+The two are mutually exclusive (`--signer` conflicts with `--address`). Everything else — the integrity guard, scan-all, JSON output — works identically in both modes.
 
 ### Signed claim — build, sign, and submit (default)
 
@@ -106,7 +105,9 @@ cargo r -p jito-bam-boost-cli -- \
 
 **Step 2** — Sign the transaction on the box that holds the identity keypair.
 
-The signature is an ed25519 signature over the transaction message bytes, spliced into the wire format the CLI emits (`[numSignatures][64-byte sigs...][message]`). Note that the stock `solana` CLI **cannot** sign an externally-built transaction like this (`sign-offchain-message` signs off-chain messages only, in a different domain), so use a hardware wallet, HSM, or a minimal ed25519 signer on that box. Pair with `--nonce` (below) so the unsigned transaction doesn't expire before it's signed.
+The signature is an ed25519 signature over the transaction message bytes, spliced into the wire format the CLI emits (`[numSignatures][64-byte sigs...][message]`). Note that the stock `solana` CLI **cannot** sign an externally-built transaction like this (`sign-offchain-message` signs off-chain messages only, in a different domain), so use a hardware wallet, HSM, or a minimal ed25519 signer on that box.
+
+> The unsigned transaction uses a **recent blockhash**, which is valid for only ~60–90 seconds. Sign and submit promptly; if it expires, rebuild and re-sign.
 
 **Step 3** — Submit the signed transaction via RPC `sendTransaction`:
 
@@ -116,52 +117,6 @@ curl -s <RPC_URL> -X POST -H 'Content-Type: application/json' -d '{
   "params":["<SIGNED_TX_BASE64>", {"encoding":"base64"}]
 }'
 ```
-
-### With durable nonce (no blockhash expiry)
-
-```bash
-# Create a nonce account first (one-time setup):
-solana create-nonce-account nonce-account.json 0.0015 \
-    --nonce-authority nonce-authority.json
-
-# Build transaction with durable nonce:
-cargo r -p jito-bam-boost-cli -- \
-    --address <VALIDATOR_IDENTITY_PUBKEY> \
-    --rpc-url <RPC_URL> \
-    --commitment confirmed \
-    --assert-deploy-slot 396979600 \
-    --nonce <NONCE_ACCOUNT_PUBKEY> \
-    --nonce-authority <NONCE_AUTHORITY_PUBKEY> \
-    bam-boost merkle-distributor claim \
-    --network mainnet \
-    --epoch <EPOCH> \
-    > unsigned_tx.b58
-```
-
-#### Durable nonces in scan-all mode (one nonce per epoch)
-
-A durable nonce is **single-use** — it advances when its transaction lands — so a single nonce can authorize exactly one claim. To claim multiple epochs offline with durable nonces, pass **one nonce account per epoch** as a comma-separated list:
-
-```bash
-cargo r -p jito-bam-boost-cli -- \
-    --address <VALIDATOR_IDENTITY_PUBKEY> \
-    --commitment confirmed \
-    --nonce N1,N2,N3 \
-    --output json \
-    bam-boost merkle-distributor claim --first-epoch <START>
-```
-
-The scanner assigns one nonce per eligible epoch in order, producing a manifest of independent, non-expiring unsigned transactions. `--nonce-authority` accepts a matching list: provide **0** (each nonce authorizes itself), **1** (applied to all), or **one per nonce**.
-
-If there are **more eligible epochs than nonce accounts**, the run aborts **before building anything** with a clear error (durable nonces are single-use), rather than emitting transactions that could never all land:
-
-```
-Error: 5 eligible epochs (983, 984, 985, 986, 987) but only 1 durable nonce account(s) provided.
-Durable nonces are single-use — provide one --nonce per claim, narrow the range with
---first-epoch/--epoch, or omit --nonce to use a recent blockhash.
-```
-
-Because the scan is idempotent (already-claimed epochs are skipped), the number of nonces you need shrinks as claims land.
 
 ### Inspect with `--print-tx` (with keypair, without sending)
 
@@ -229,7 +184,7 @@ This is deliberate. A signer must verify **what it is signing by decoding the tr
 solana decode-transaction <unsigned_tx_base64> base64
 ```
 
-`unsigned_tx_base64` is in the exact encoding Solana RPC expects for `simulateTransaction` / `sendTransaction` with `encoding: "base64"`. Combine with [durable nonces](#with-durable-nonce-no-blockhash-expiry) so the manifest doesn't expire before the validator signs.
+`unsigned_tx_base64` is in the exact encoding Solana RPC expects for `simulateTransaction` / `sendTransaction` with `encoding: "base64"`. Each transaction uses a recent blockhash (valid ~60–90s), so sign and submit the manifest promptly; rebuild if it goes stale.
 
 Example Ansible task:
 
@@ -273,11 +228,9 @@ cargo r -p jito-bam-boost-cli -- \
 
 ```mermaid
 graph LR
-    A["1. AdvanceNonce<br/>(if --nonce)"] --> B["2. Lighthouse Assert<br/>(if --assert-deploy-slot)"]
-    B --> C["3. Create ATA<br/>(idempotent)"]
-    C --> D["4. Claim<br/>(merkle proof)"]
+    B["1. Lighthouse Assert<br/>(if --assert-deploy-slot)"] --> C["2. Create ATA<br/>(idempotent)"]
+    C --> D["3. Claim<br/>(merkle proof)"]
 
-    style A fill:#e1f5fe
     style B fill:#fff9c4
     style C fill:#e8f5e8
     style D fill:#e8f5e8
@@ -285,10 +238,9 @@ graph LR
 
 | Position | Instruction | When included | Purpose |
 |----------|-------------|---------------|---------|
-| 1 | `AdvanceNonceAccount` | `--nonce` provided | Durable nonce — replaces blockhash |
-| 2 | `AssertUpgradeableLoaderAccount` | `--assert-deploy-slot` provided | Lighthouse guard — tx fails if program bytecode changed |
-| 3 | `CreateIdempotent` | Always | Creates JitoSOL ATA if needed |
-| 4 | `Claim` | Always | Claims JitoSOL via merkle proof |
+| 1 | `AssertUpgradeableLoaderAccount` | `--assert-deploy-slot` enabled | Lighthouse guard — tx fails if program bytecode changed |
+| 2 | `CreateIdempotent` | Always | Creates JitoSOL ATA if needed |
+| 3 | `Claim` | Always | Claims JitoSOL via merkle proof |
 
 ## Flags Reference
 
@@ -301,8 +253,6 @@ graph LR
 | `--print-tx` | No | Output unsigned tx instead of sending |
 | `--output <text\|json>` | No (default: `text`) | Format for built unsigned txs. `text` = base58 per line; `json` = manifest array on stdout (logs on stderr) for automation |
 | `--assert-deploy-slot <auto\|slot\|off>` | No (default: `auto`) | Lighthouse program-integrity guard. `auto` resolves the current ProgramData deploy slot from RPC; a number pins an explicit slot; `off` disables it |
-| `--nonce <pubkey[,...]>` | No | Durable nonce account(s), comma-separated. Scan-all needs one per epoch claimed (single-use); fails closed if too few |
-| `--nonce-authority <pubkey[,...]>` | No | Nonce authority/authorities. 0 (each nonce authorizes itself), 1 (applied to all), or one per `--nonce` |
 | `--network <mainnet\|testnet>` | No (default: mainnet) | Network for merkle tree GCS path |
 | `--epoch <epoch>` | No | Epoch to claim. Omit to scan/claim all eligible epochs |
 | `--first-epoch <epoch>` | No (default: auto-discover) | First epoch to scan in scan-all mode (when `--epoch` omitted). Omit to walk back from the current epoch to the earliest published merkle tree |
